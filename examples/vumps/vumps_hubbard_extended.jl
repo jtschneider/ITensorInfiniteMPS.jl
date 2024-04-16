@@ -105,7 +105,7 @@ maxdims =
 ## setcutoff!(sweeps, cutoff)
 
 println("\nRun DMRG on $Nfinite sites")
-energy_finite_total, ψfinite = dmrg(Hfinite, ψfinite; nsweeps, maxdims, cutoff)
+energy_finite_total, ψfinite = dmrg(Hfinite, ψfinite; nsweeps, maxdim=maxdims, cutoff)
 println("\nEnergy density")
 @show energy_finite_total / Nfinite
 
