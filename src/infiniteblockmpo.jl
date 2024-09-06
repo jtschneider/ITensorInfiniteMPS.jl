@@ -345,3 +345,317 @@ function combineblocks_linkinds(H::InfiniteBlockMPO)
   H, _ = combineblocks_linkinds_auxiliary(H)
   return H
 end
+
+function InfGenericHamiltonianMPO(
+  sites::ITensorInfiniteMPS.CelledVector,
+  AStrings::Vector{String},
+  JAs::Vector{<:Number},
+  BStrings::Vector{String},
+  JBs::Vector{<:Number},
+  CStrings::Vector{String},
+  JCs::Vector{<:Number},
+  DString::String,
+  JD::Number,
+)
+
+  @assert (length(AStrings) == length(JAs)) &&
+    (length(BStrings) == length(JBs)) &&
+    (length(CStrings) == length(JCs))
+
+  @assert (length(JBs) == length(JAs)) &&
+    (length(JCs) == length(JBs)) &&
+    (length(JAs) == length(JCs))
+
+
+
+  NrOfTerms = length(AStrings)
+  # A is possible exponential decay so test for "0"
+  As = if prod(AStrings .== "0")
+    map(x -> 0.0 * op("Id", sites[2]), zeros(NrOfTerms))
+  else
+    map(x -> x[1] * op(x[2], sites[2]), zip(JAs, AStrings))
+  end
+  
+  #### check if A is zero
+  if iszero(As) 
+    return InfGenericHamiltonianMPO_NN(sites, BStrings, JBs, CStrings, JCs, DString, JD)
+  else
+    return InfGenericHamiltonianMPO_3Form(sites, AStrings, JAs, BStrings, JBs, CStrings, JCs, DString, JD)
+  end
+end
+
+function InfGenericHamiltonianMPO_NN(
+  sites::ITensorInfiniteMPS.CelledVector,
+  BStrings::Vector{String},
+  JBs::Vector{<:Number},
+  CStrings::Vector{String},
+  JCs::Vector{<:Number},
+  DString::String,
+  JD::Number,
+)
+  @assert length(sites) == 2
+
+  link = get_linkindices(sites, 1, BStrings, CStrings)[1]
+  link_trans = get_linkindices(sites, 1, BStrings, CStrings)[1]
+  
+  W_left   = fill_left_W(1, sites, link, CStrings, JCs, DString, JD;)
+  W_right = fill_right_W(2, sites, dag(link), BStrings, JBs;)
+
+  W_left_trans   = fill_left_W(2, sites, link_trans, CStrings, JCs, DString, JD;)
+  W_right_trans = fill_right_W(3, sites, dag(link_trans), BStrings, JBs;)
+
+  # blocked_mats_ofW = [
+  #   ITensorInfiniteMPS.local_mpo_blocks(W_left, dag(link); position=:last),
+  #   ITensorInfiniteMPS.local_mpo_blocks(W_right, link; position=:first),
+  # ]
+  # return InfiniteBlockMPO(blocked_mats_ofW)
+  
+  return InfiniteSum{MPO}([MPO([W_left,W_right]),MPO([W_left_trans,W_right_trans])], translator(sites))
+
+
+end
+
+function InfGenericHamiltonianMPO_3Form(
+  sites::ITensorInfiniteMPS.CelledVector,
+  AStrings::Vector{String},
+  JAs::Vector{<:Number},
+  BStrings::Vector{String},
+  JBs::Vector{<:Number},
+  CStrings::Vector{String},
+  JCs::Vector{<:Number},
+  DString::String,
+  JD::Number,
+)
+  @assert length(sites) == 2
+
+  linkindices = get_linkindices(sites, 2, BStrings, CStrings)
+  linkindices_trans = get_linkindices(sites, 2, BStrings, CStrings)
+
+  
+  W_left   = fill_left_W(1, sites, linkindices[1], CStrings, JCs, DString, JD;)
+  W_bulk   = fill_bulk_W(2, sites, dag(linkindices[1]), linkindices[2], AStrings, JAs;)
+  W_right  = fill_right_W(3, sites, dag(linkindices[2]), BStrings, JBs;)
+
+  W_left_trans   = fill_left_W(2, sites, linkindices_trans[1], CStrings, JCs, DString, JD;)
+  W_bulk_trans   = fill_bulk_W(3, sites, dag(linkindices_trans[1]), linkindices_trans[2], AStrings, JAs;)
+  W_right_trans  = fill_right_W(4, sites, dag(linkindices_trans[2]), BStrings, JBs;)
+
+  # blocked_mats_ofW = [
+  #   ITensorInfiniteMPS.local_mpo_blocks(W_left, dag(linkindices[1]); position=:first),
+  #   ITensorInfiniteMPS.local_mpo_blocks(W_bulk, linkindices[1], dag(linkindices[2])),
+  #   ITensorInfiniteMPS.local_mpo_blocks(W_right, linkindices[2]; position=:last),
+  # ]
+  # return InfiniteBlockMPO(blocked_mats_ofW, translator(sites))
+  return InfiniteSum{MPO}([MPO([W_left,W_bulk,W_right]), MPO([W_left_trans, W_bulk_trans, W_right_trans])], translator(sites))
+
+end
+
+function get_linkindices(
+  sites::ITensorInfiniteMPS.CelledVector,
+  n_links::Int64,
+  BStrings::Vector{String},
+  CStrings::Vector{String},
+)
+  if length(BStrings) != length(CStrings)
+    throw(
+      ArgumentError(
+        "Cannot have unequal length of BStrings and CStrings!\n$(@show length(BStrings)) $(@show length(CStrings))",
+      ),
+    )
+  end
+  nTerms = length(BStrings)
+
+  link_dimension = nTerms + 2
+
+  linkindices = if hasqns(sites.data)
+    Vector{Index{Vector{Pair{QN,Int64}}}}(undef, n_links)
+  else
+    Vector{Index{Int64}}(undef, n_links)
+  end
+
+  if hasqns(sites.data)
+    # save QN flux of each operator, note that multiple operators may have same flux,
+    # thus beloning to the same block and increasing the local dimension of this block
+    # reuse the vector to save memory
+    QNFlux_vector = Vector{QN}(undef, length(BStrings))
+
+    for n in 1:n_links
+      # save the flux and the corresponding dimension in a dynamically sized vector as it is ordered in historical order
+      # same as the corresponding operators
+      QN_local_index_dim = Vector{Pair{QN,Int64}}(undef, 1)
+      nameQN = String(qn(sites[n][1]).data[1].name)
+      QNmodulus = qn(sites[n][1]).data[1].modulus
+      # loop over all interaction operators
+      for (indexOP, (BString, CString)) in enumerate(zip(BStrings, CStrings))
+        # get the flux of interaction
+        # QNFlux_vector[indexOP] = flux(sites, Bstring, n, CString, n + 1)
+        QNFlux_vector[indexOP] = flux(op(BString, sites[n]))
+        checkflux = flux(op(CString, sites[n]))
+        if !(checkflux == -QNFlux_vector[indexOP])
+          error(
+            "Operators B and C are not conserving the total QN in the system as their flux is not opposite",
+          )
+        end
+        # local dimension of flux is at least 1
+        if indexOP == 1
+          QN_local_index_dim[indexOP] = Pair(QNFlux_vector[indexOP], 1)
+        elseif indexOP > 1 && QNFlux_vector[indexOP - 1] == QNFlux_vector[indexOP]
+          # increase tuple of number and dimension by one in dimension
+          QN_local_index_dim[end] = Pair(
+            QN_local_index_dim[end][1], QN_local_index_dim[end][2] + 1
+          )
+        elseif indexOP > 1
+          # if new flux is encountered, save in vector
+          push!(QN_local_index_dim, Pair(QNFlux_vector[indexOP], 1))
+        end
+      end # loop over interaction operators
+      # # construct the local link index from all flux blocks and their dimension
+      linkindices[n] = Index(
+        [QN() => 1, QN_local_index_dim..., QN(nameQN, 0, QNmodulus) => 1], "Link,l=1"
+      )
+    end
+    # do not forget about last index
+    # linkindices[n_links + 1] = sim(linkindices[n_links]; tags="Link,l=1")
+  else
+    linkindices[:] = [Index(link_dimension, "Link,l=1") for n in 1:(n_links)]
+  end
+  return linkindices
+end
+
+function fill_right_W(
+  n::Int,
+  sites,
+  ll,
+  BStrings::Vector{String},
+  JBs::Vector{<:Number};
+  endState = 1
+  )
+
+  s = sites[n]
+
+  Bs = map(x -> x[1] * op(x[2], sites[n]), zip(JBs, BStrings)) # JB * op(sites, BString, n)
+
+  ElType = promote_itensor_eltype(Bs)
+  # Init ITensor inside MPO
+  W_store = ITensor(ElType, s', dag(s), ll)
+
+  # first element
+  W_store += setelt(ll[endState]) * op("Id", sites[n])
+  for (iM, B,) in enumerate(Bs)
+    # CHECK FOR NILL-POTENT OPERATORS or operators proportional to zero
+    # avoid setting entries explicitly zero because that counters the purpose of sparse matrices and 
+    # heavily reduces the runtime efficiency
+    iszero(B) ? nothing : W_store += setelt(ll[1 + iM]) * B
+  end
+  return W_store
+end
+
+function fill_left_W(
+  n::Int,
+  sites,
+  rl,
+  CStrings::Vector{String},
+  JCs::Vector{<:Number},
+  DString::String,
+  JD::Number;
+  startState = dim(rl),
+  endState = 1)
+
+  s = sites[n]
+  
+  Cs = map(x -> x[1] * op(x[2], sites[n]), zip(JCs, CStrings)) # JC * op(sites, CString, n)
+  D = JD * op(DString, sites[n])
+
+  ElType = promote_itensor_eltype([Cs..., D])
+  # Init ITensor inside MPO
+  W_store = ITensor(ElType, s', dag(s), rl)
+  W_store += setelt(rl[startState]) * op("Id", sites[n])
+  # CHECK FOR NILL-POTENT OPERATORS or operators proportional to zero
+  # avoid setting entries explicitly zero because that counters the purpose of sparse matrices and 
+  # heavily reduces the runtime efficiency
+  iszero(D) ? nothing : W_store += setelt(rl[endState]) * D
+  for (iM, C) in enumerate(Cs)
+    iszero(C) ? nothing : W_store += setelt(rl[1 + iM]) * C
+  end
+  return W_store
+end
+
+function fill_bulk_W(
+  n::Int,
+  sites,
+  ll,
+  rl,
+  AStrings::Vector{String}, JAs::Vector{<:Number};
+  startState = dim(ll),
+  endState = 1
+)
+  s = sites[n]
+
+  As = if prod(AStrings .== "0")
+    map(x -> 0.0 * op("Id", sites[n]), zeros(length(JAs)))
+  else
+    map(x -> x[1] * op(x[2], sites[n]), zip(JAs, AStrings))
+  end
+
+  ElType = promote_itensor_eltype(As)
+  # Init ITensor inside MPO
+  W_store = ITensor(ElType, s', dag(s), ll, rl)
+
+  # first element
+  W_store += setelt(ll[startState]) * (setelt(rl[startState])) * op("Id", sites[n])
+  W_store += setelt(ll[endState]) * (setelt(rl[endState])) * op("Id", sites[n])
+  for (iM, A) in enumerate(As)
+    iszero(A) ? nothing : W_store += setelt(ll[1 + iM]) * (setelt(rl[1 + iM])) * A
+  end
+  return W_store
+end
+
+
+function fill_bulk_finite_W(
+  n::Int,
+  sites,
+  ll,
+  rl,
+  AStrings::Vector{String},
+  JAs::Vector{<:Number},
+  BStrings::Vector{String},
+  JBs::Vector{<:Number},
+  CStrings::Vector{String},
+  JCs::Vector{<:Number},
+  DString::String,
+  JD::Number;
+  startState = dim(ll),
+  endState = 1
+)
+
+  # siteindex s
+  # n_cell = length(sites)
+  s = sites[n]
+  # ll = (linkindices[n])
+  # rl = dag(linkindices[n + 1])
+
+
+  As = if prod(AStrings .== "0")
+    map(x -> 0.0 * op("Id", sites[2]), zeros(length(JAs)))
+  else
+    map(x -> x[1] * op(x[2], sites[2]), zip(JAs, AStrings))
+  end
+  Bs = map(x -> x[1] * op(x[2], sites[n]), zip(JBs, BStrings)) 
+  Cs = map(x -> x[1] * op(x[2], sites[n]), zip(JCs, CStrings)) # JC * op(sites, CString, n)
+  D = JD * op(DString, sites[n])
+
+  ElType = promote_itensor_eltype([As...,Bs...,Cs...,D])
+  # Init ITensor inside MPO
+  W_store = ITensor(ElType, s', dag(s), ll, rl)
+
+  # first element
+  W_store += setelt(ll[startState]) * (setelt(rl[startState])) * op("Id", sites[n])
+  W_store += setelt(ll[endState]) * (setelt(rl[endState])) * op("Id", sites[n])
+  iszero(D) ? nothing : W_store += setelt(rl[endState]) * D
+  for (iM, (A, B, C)) in enumerate(zip(As, Bs, Cs))
+    iszero(A) ? nothing : W_store += setelt(ll[1+iM]) * setelt(rl[1+iM]) * A
+    iszero(B) ? nothing : W_store += setelt(ll[1+iM]) * setelt(rl[endState]) * B
+    iszero(C) ? nothing : W_store += setelt(ll[startState]) * setelt(rl[1+iM]) * C
+  end
+  return W_store
+end
