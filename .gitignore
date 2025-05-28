@@ -2,3 +2,4 @@
 /examples/vumps/Manifest.toml
 /test/Manifest.toml
 *.swp
+.vscode/
